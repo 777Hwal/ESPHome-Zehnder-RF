@@ -1,0 +1,179 @@
+substitutions:
+  name: "ventilation"
+  friendly_name: Ventilation
+
+esphome:
+  name: ${name}
+  comment: ${friendly_name}
+
+esp32:
+  board: esp32doit-devkit-v1
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "YwH03VM9GnVi6tagb7dIFqx9tFdymUCYUfomol2oaFg="
+
+# OTA updates (simplified form)
+ota:
+  - platform: esphome
+    password: !secret esphome_utility_bridge_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none   
+  manual_ip:
+    static_ip: 192.168.178.208
+    gateway: 192.168.178.1
+    subnet: 255.255.255.0  
+
+  ap:
+    ssid: "Ventilation Fallback"
+    password: !secret esphome_utility_bridge_ap_password
+
+# Just for testing, now comment out    
+# web_server:
+#  port: 80
+#    auth:
+#    username: !secret web_server_username
+#    password: !secret web_server_password
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    timezone: Europe/Amsterdam
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+# SPI
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+  miso_pin: GPIO12
+
+# nRF905 config
+nrf905:
+  id: "nrf905_rf"
+  cs_pin: GPIO15
+  cd_pin: GPIO33
+  ce_pin: GPIO27
+  pwr_pin: GPIO26
+  txen_pin: GPIO25
+
+# The FAN controller
+fan:
+  - platform: zehnder
+    id: zehnder_fan
+    name: "Ventilation"
+    nrf905: nrf905_rf
+    update_interval: 60s
+
+
+# Drop down 5 positions
+globals:
+  # Countdown timer in minutes, used for timed speed modes
+  - id: countdown_timer
+    type: int
+    initial_value: '0'
+
+  # Track the requested speed separately, so we can rebroadcast if needed
+  - id: requested_speed
+    type: int
+    initial_value: '1'
+
+interval:
+  # Every 60 seconds → decrement countdown timer
+  - interval: 60s
+    then:
+      lambda: |-
+        if (id(countdown_timer) > 0) {
+          id(countdown_timer) -= 1;
+          if (id(countdown_timer) == 0) {
+            // Timer finished → return to Speed 1
+            id(requested_speed) = 1;
+            id(zehnder_fan).setSpeed(1);
+            id(fan_speed_select).publish_state("Speed 1");
+          }
+        }
+
+  # Every 5 seconds → check if actual fan speed matches requested speed
+  - interval: 5s
+    then:
+      lambda: |-
+        int actual_speed = id(zehnder_fan).speed;
+        if (actual_speed != id(requested_speed)) {
+          // Rebroadcast the requested speed if mismatch
+          id(zehnder_fan).setSpeed(id(requested_speed));
+          ESP_LOGW("fan", "Rebroadcasting speed %d due to mismatch", id(requested_speed));
+        }
+
+select:
+  # Dropdown menu for selecting fan speed (Speed 2/3 always timed 120 min)
+  - platform: template
+    name: "Fan Speed Control"
+    id: fan_speed_select
+    optimistic: true
+    options:
+      - "Speed 1"
+      - "Speed 2"
+      - "Speed 3"
+      - "High 10 min"
+      - "High 30 min"
+    initial_option: "Speed 1"
+    set_action:
+      - lambda: |-
+          // Handle each option and set speed + timer accordingly
+          if (x == "Speed 1") {
+            id(requested_speed) = 1;
+            id(zehnder_fan).setSpeed(1);
+            id(countdown_timer) = 0;
+
+          } else if (x == "Speed 2") {
+            // Speed 2 always timed for 120 minutes
+            id(requested_speed) = 2;
+            id(zehnder_fan).setSpeed(2, 120);
+            id(countdown_timer) = 120;
+
+          } else if (x == "Speed 3") {
+            // Speed 3 always timed for 120 minutes
+            id(requested_speed) = 3;
+            id(zehnder_fan).setSpeed(3, 120);
+            id(countdown_timer) = 120;
+
+          } else if (x == "High 10 min") {
+            id(requested_speed) = 3;
+            id(zehnder_fan).setSpeed(3, 10);
+            id(countdown_timer) = 10;
+
+          } else if (x == "High 30 min") {
+            id(requested_speed) = 3;
+            id(zehnder_fan).setSpeed(3, 30);
+            id(countdown_timer) = 30;
+          }
+
+text_sensor:
+  - platform: template
+    name: "Timer"
+    id: timer
+    lambda: |-
+      if (id(requested_speed) == 1) {
+        // Hide timer when Speed 1 or no countdown
+        return std::string("No timer active");
+      } else {
+        char buffer[64];
+        sprintf(buffer, "Remaining: %d min", id(countdown_timer));
+        return std::string(buffer);
+      }
+    update_interval: 5s
