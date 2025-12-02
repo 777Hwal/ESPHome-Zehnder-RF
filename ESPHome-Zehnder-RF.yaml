@@ -53,9 +53,11 @@ time:
     timezone: Europe/Amsterdam
 
 external_components:
-  - source:
-      type: local
-      path: components
+  - source: github://777Hwal/ESPHome-Zehnder-RF
+
+#  - source:
+#      type: local
+#      path: components
 
 # SPI
 spi:
@@ -80,8 +82,6 @@ fan:
     nrf905: nrf905_rf
     update_interval: 60s
 
-
-# Drop down 5 positions
 globals:
   # Countdown timer in minutes, used for timed speed modes
   - id: countdown_timer
@@ -93,34 +93,75 @@ globals:
     type: int
     initial_value: '1'
 
+  # Flag to indicate whether the last change originated locally (this device)
+  # true  = local change → we rebroadcast every 5s if mismatch
+  # false = external change → we adopt external speed, sync UI, and start timers
+  - id: local_change
+    type: bool
+    initial_value: 'false'
+
 interval:
-  # Every 60 seconds → decrement countdown timer
+  # Every 60 seconds → decrement the countdown timer and end timed mode when it hits zero
   - interval: 60s
     then:
       lambda: |-
         if (id(countdown_timer) > 0) {
           id(countdown_timer) -= 1;
           if (id(countdown_timer) == 0) {
-            // Timer finished → return to Speed 1
+            // Timer finished → return to Speed 1 locally
             id(requested_speed) = 1;
+            id(local_change) = true;   // this device initiates the change
             id(zehnder_fan).setSpeed(1);
             id(fan_speed_select).publish_state("Speed 1");
           }
         }
 
-  # Every 5 seconds → check if actual fan speed matches requested speed
+  # Every 5 seconds → either rebroadcast local speed or adopt external changes and start timers
   - interval: 5s
     then:
       lambda: |-
         int actual_speed = id(zehnder_fan).speed;
-        if (actual_speed != id(requested_speed)) {
-          // Rebroadcast the requested speed if mismatch
-          id(zehnder_fan).setSpeed(id(requested_speed));
-          ESP_LOGW("fan", "Rebroadcasting speed %d due to mismatch", id(requested_speed));
+
+        if (id(local_change)) {
+          // Local-origin change: enforce our requested speed by rebroadcasting
+          if (actual_speed != id(requested_speed)) {
+            id(zehnder_fan).setSpeed(id(requested_speed));
+            ESP_LOGW("fan", "Rebroadcasting speed %d due to mismatch", id(requested_speed));
+          }
+          else {
+          id(local_change) = false;
+          }
+        } else {
+          // External-origin change: adopt the device's actual speed, start timers as needed, and sync UI
+          if (actual_speed != id(requested_speed)) {
+            id(requested_speed) = actual_speed;
+
+            // Start appropriate timers for external changes
+            if (actual_speed == 1) {
+              id(countdown_timer) = 0;
+              id(fan_speed_select).publish_state("Speed 1");
+              ESP_LOGI("fan", "External change → Speed 1, No timer active");
+            } else if (actual_speed == 2) {
+              // External Speed 2 → default timed 120 minutes
+              id(countdown_timer) = 120;
+              id(fan_speed_select).publish_state("Speed 2");
+              ESP_LOGI("fan", "External change → Speed 2, timer started (120 min)");
+            } else if (actual_speed == 3) {
+              // External Speed 3 → default timed 120 minutes (cannot distinguish High 10/30 externally)
+              id(countdown_timer) = 120;
+              id(fan_speed_select).publish_state("Speed 3");
+              ESP_LOGI("fan", "External change → Speed 3, timer started (120 min)");
+            } else {
+              // Unknown speeds: just sync without timer
+              id(countdown_timer) = 0;
+              ESP_LOGW("fan", "External change → Unknown speed %d, no timer set", actual_speed);
+            }
+          }
         }
 
 select:
-  # Dropdown menu for selecting fan speed (Speed 2/3 always timed 120 min)
+  # Dropdown menu for selecting fan speed
+  # Note: Speed 2 and Speed 3 are always timed for 120 minutes
   - platform: template
     name: "Fan Speed Control"
     id: fan_speed_select
@@ -134,6 +175,9 @@ select:
     initial_option: "Speed 1"
     set_action:
       - lambda: |-
+          // Mark this as a local-origin change
+          id(local_change) = true;
+
           // Handle each option and set speed + timer accordingly
           if (x == "Speed 1") {
             id(requested_speed) = 1;
@@ -141,13 +185,13 @@ select:
             id(countdown_timer) = 0;
 
           } else if (x == "Speed 2") {
-            // Speed 2 always timed for 120 minutes
+            // Always timed for 120 minutes
             id(requested_speed) = 2;
             id(zehnder_fan).setSpeed(2, 120);
             id(countdown_timer) = 120;
 
           } else if (x == "Speed 3") {
-            // Speed 3 always timed for 120 minutes
+            // Always timed for 120 minutes
             id(requested_speed) = 3;
             id(zehnder_fan).setSpeed(3, 120);
             id(countdown_timer) = 120;
@@ -164,12 +208,13 @@ select:
           }
 
 text_sensor:
+  # Human-readable timer status
   - platform: template
     name: "Timer"
     id: timer
     lambda: |-
-      if (id(requested_speed) == 1) {
-        // Hide timer when Speed 1 or no countdown
+      if (id(requested_speed) == 1 || id(countdown_timer) == 0) {
+        // Hide timer when Speed 1 or no countdown is active
         return std::string("No timer active");
       } else {
         char buffer[64];
